@@ -1,9 +1,9 @@
 # ascii-weather
 
-Built with [Astro](https://astro.build) and the [ascii.rest](https://github.com/bas3line/ascii) animation library.
+A compact weather app drawn as one ascii screen. Enter a US ZIP code (default 78750, Austin) and it shows the
+current weather, the next eight hours, and animated halftone scenes and graphics for the conditions.
 
 Live: https://barretts.github.io/ascii-weather/ (deployed from `main` by `.github/workflows/pages.yml`).
-current weather, the next eight hours, and animated halftone scenes and graphics for the conditions.
 
 Built with [Astro](https://astro.build) and the [ascii.rest](https://github.com/bas3line/ascii) animation library.
 
