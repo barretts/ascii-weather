@@ -6,11 +6,11 @@
     <meta name="theme-color" content="#0a0d0b" />
     <title>Weather · ascii.rest</title>
     <meta name="description" content="A compact weather forecast drawn entirely in ascii, animated with ascii.rest pieces." />
-    <style is:global>
-      /* Box drawing and block glyphs a system face lacks come from the site's 3 KB cut of JetBrains Mono. */
+    <style is:inline>
+      /* Box drawing and block glyphs a system face lacks come from a 3 KB cut of JetBrains Mono. The URL is relative so the page works under any base path. */
       @font-face {
         font-family: "ascii.rest mono";
-        src: url("/fonts/ascii-rest-mono.woff2") format("woff2");
+        src: url("fonts/ascii-rest-mono.woff2") format("woff2");
         unicode-range: U+00B0, U+00B7, U+2022, U+2500-259F, U+25CF;
         font-display: swap;
       }
