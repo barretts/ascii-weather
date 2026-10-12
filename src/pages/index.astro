@@ -45,9 +45,9 @@
   <body>
     <main>
       <h1 class="sr">Weather</h1>
-      <form id="zip-form" class="sr">
-        <label for="zip">US ZIP code</label>
-        <input id="zip" name="zip" inputmode="numeric" autocomplete="postal-code" maxlength="5" value="78750" />
+      <form id="zip-form" class="sr" autocomplete="off">
+        <label for="wx-code">Weather ZIP code</label>
+        <input id="wx-code" name="wx-code" type="text" inputmode="numeric" maxlength="5" value="78750" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" data-1p-ignore data-lpignore="true" data-bwignore data-form-type="other" />
         <button type="submit">Show weather</button>
       </form>
       <p id="summary" class="sr" aria-live="polite"></p>
@@ -68,7 +68,7 @@
 
       const DEFAULT_ZIP = "78750";
       const form = document.querySelector<HTMLFormElement>("#zip-form")!;
-      const input = document.querySelector<HTMLInputElement>("#zip")!;
+      const input = document.querySelector<HTMLInputElement>("#wx-code")!;
       const screen = document.querySelector<HTMLPreElement>("#screen")!;
       const summary = document.querySelector<HTMLElement>("#summary")!;
       const announce = document.querySelector<HTMLElement>("#announce")!;
@@ -249,7 +249,11 @@
         const caret = focus && (still || Math.floor(now / 500) % 2 === 0) ? "▌" : " ";
         c = text(r, c, "zip ", "m");
         c = text(r, c, "[", focus ? "a" : "d");
-        c = text(r, c, ` ${(input.value + caret).padEnd(6)} `, focus ? "a" : "");
+        // The whole value selected shows inverted, so a click that selects it for replacing is visible.
+        const all = focus && input.value.length > 0 && input.selectionStart === 0 && input.selectionEnd === input.value.length;
+        c = text(r, c, " ", focus ? "a" : "");
+        c = text(r, c, input.value, all ? "b" : focus ? "a" : "");
+        c = text(r, c, (all ? " " : caret) + " ".repeat(Math.max(0, 6 - input.value.length - 1)) + " ", focus ? "a" : "");
         c = text(r, c, "]", focus ? "a" : "d");
         go = { r, c0: c + 1, c1: c + 6 };
         text(r, c + 1, "[ go ]", hoverGo ? "b" : "m");
@@ -766,8 +770,10 @@
         input.value = input.value.replace(/\D/g, "").slice(0, 5);
         redraw();
       });
-      input.addEventListener("focus", redraw);
+      input.addEventListener("focus", () => (input.select(), redraw()));
       input.addEventListener("blur", redraw);
+      input.addEventListener("select", redraw);
+      document.addEventListener("selectionchange", () => document.activeElement === input && redraw());
 
       // The screen is one picture: map a pointer to its cell to press [ go ] or focus the field.
       const cellAt = (e: PointerEvent) => {
@@ -781,7 +787,7 @@
       screen.addEventListener("pointerdown", (e) => {
         e.preventDefault();
         if (onGo(e)) form.requestSubmit();
-        else input.focus();
+        else (input.focus(), input.select());
       });
       screen.addEventListener("pointermove", (e) => {
         const over = onGo(e);
