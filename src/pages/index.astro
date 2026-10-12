@@ -1,0 +1,816 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#0a0d0b" />
+    <title>Weather · ascii.rest</title>
+    <meta name="description" content="A compact weather forecast drawn entirely in ascii, animated with ascii.rest pieces." />
+    <style is:global>
+      /* Box drawing and block glyphs a system face lacks come from the site's 3 KB cut of JetBrains Mono. */
+      @font-face {
+        font-family: "ascii.rest mono";
+        src: url("/fonts/ascii-rest-mono.woff2") format("woff2");
+        unicode-range: U+00B0, U+00B7, U+2022, U+2500-259F, U+25CF;
+        font-display: swap;
+      }
+      :root { color-scheme: dark; background: #0a0d0b; color: #cfe3c4; }
+      body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 12px; box-sizing: border-box; }
+      #screen {
+        margin: 0;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", "ascii.rest mono", monospace;
+        font-size: 13px;
+        line-height: 1.2;
+        letter-spacing: 0;
+        white-space: pre;
+        font-variant-ligatures: none;
+        cursor: text;
+      }
+      #screen .a { color: #d7f08f; }
+      #screen .m { color: #7d907a; }
+      #screen .d { color: #3f5244; }
+      #screen .e { color: #ff9b7d; }
+      #screen .h { color: #e9d08a; }
+      #screen .c { color: #7fc8e6; }
+      #screen .w { color: #f2f6fa; }
+      #screen .b { color: #0a0d0b; background: #d7f08f; }
+      .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+      #stage { position: relative; }
+      #hero { position: absolute; display: none; overflow: hidden; pointer-events: none; background: #05070a; }
+      #thumbs { position: absolute; inset: 0; pointer-events: none; }
+      #thumbs canvas { position: absolute; outline: 1px solid #29342e; background: #05070a; }
+      #big { position: absolute; pointer-events: none; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1 class="sr">Weather</h1>
+      <form id="zip-form" class="sr">
+        <label for="zip">US ZIP code</label>
+        <input id="zip" name="zip" inputmode="numeric" autocomplete="postal-code" maxlength="5" value="78750" />
+        <button type="submit">Show weather</button>
+      </form>
+      <p id="summary" class="sr" aria-live="polite"></p>
+      <p id="announce" class="sr" role="status"></p>
+      <div id="stage"><pre id="screen" aria-hidden="true"></pre><div id="hero" aria-hidden="true"></div><div id="thumbs" aria-hidden="true"></div><canvas id="big" aria-hidden="true"></canvas></div>
+    </main>
+    <script>
+      import { load, mount } from "ascii.rest";
+
+      type Frame = (t: number, env?: { paper?: boolean }) => string;
+      type SceneName = "sunrise" | "moon-phases" | "wind" | "rain" | "snowfall" | "storm-plains" | "alpine-dawn" | "misty-forest" | "night-coast" | "ocean-sunset";
+      interface Hour { label: string; temp: number; code: number; rain: number; day: boolean }
+      interface Weather {
+        zip: string; place: string; state: string; date: string; zone: string; updated: string;
+        temp: number; feels: number; code: number; day: boolean;
+        high: number; low: number; wind: number; humidity: number; rain: number; hours: Hour[];
+      }
+
+      const DEFAULT_ZIP = "78750";
+      const form = document.querySelector<HTMLFormElement>("#zip-form")!;
+      const input = document.querySelector<HTMLInputElement>("#zip")!;
+      const screen = document.querySelector<HTMLPreElement>("#screen")!;
+      const summary = document.querySelector<HTMLElement>("#summary")!;
+      const announce = document.querySelector<HTMLElement>("#announce")!;
+      const still = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+      // --- weather codes ------------------------------------------------------
+      const NAMES: Record<number, string> = {
+        0: "Clear sky", 1: "Mostly clear", 2: "Partly cloudy", 3: "Overcast",
+        45: "Fog", 48: "Freezing fog", 51: "Light drizzle", 53: "Drizzle", 55: "Heavy drizzle",
+        56: "Freezing drizzle", 57: "Freezing drizzle", 61: "Light rain", 63: "Rain", 65: "Heavy rain",
+        66: "Freezing rain", 67: "Freezing rain", 71: "Light snow", 73: "Snow", 75: "Heavy snow",
+        77: "Snow grains", 80: "Light showers", 81: "Showers", 82: "Heavy showers",
+        85: "Snow showers", 86: "Heavy snow showers", 95: "Thunderstorm", 96: "Thunderstorm", 99: "Thunderstorm",
+      };
+      const nameOf = (code: number) => NAMES[code] ?? "Unknown";
+      const wet = (code: number) => (code >= 51 && code <= 67) || (code >= 80 && code <= 82);
+      const snowy = (code: number) => code >= 71 && code <= 86;
+      // The coloured halftone scenes are drawn on a canvas, far finer than the character grid; the rest are text pieces.
+      const CANVAS = new Set<SceneName>(["storm-plains", "alpine-dawn", "misty-forest", "night-coast", "ocean-sunset"]);
+      const scene = (code: number, day: boolean): SceneName =>
+        code >= 95 || wet(code) ? "storm-plains" : snowy(code) ? "alpine-dawn" : code === 45 || code === 48 || (code === 3 && day) ? "misty-forest" : !day ? "night-coast" : code <= 2 ? "ocean-sunset" : "wind";
+      type Kind = "clear" | "partly" | "cloudy" | "fog" | "rain" | "snow" | "storm";
+      const kindOf = (code: number): Kind =>
+        code >= 95 ? "storm" : snowy(code) ? "snow" : wet(code) ? "rain" : code === 45 || code === 48 ? "fog" : code <= 1 ? "clear" : code === 2 ? "partly" : "cloudy";
+
+      const SPIN = "|/-\\";
+
+      // --- 2x2 pixels a cell: quadrant blocks, bits 1 top left, 2 top right, 4 bottom left, 8 bottom right ---
+      const QUAD = " ▘▝▀▖▌▞▛▗▚▐▜▄▙▟█";
+      // (quadrant blocks above; the canvas scenes need no dither)
+      function pixels(cols: number, rows: number) {
+        const w = cols * 2, h = rows * 2;
+        const mask = new Uint8Array(cols * rows);
+        const kind = new Uint8Array(cols * rows); // 1 fill, 2 line
+        const set = (x: number, y: number, line = false) => {
+          if (x < 0 || y < 0 || x >= w || y >= h) return;
+          const i = (y >> 1) * cols + (x >> 1);
+          mask[i] |= 1 << ((y & 1) * 2 + (x & 1));
+          if (line) kind[i] = 2;
+          else if (!kind[i]) kind[i] = 1;
+        };
+        const flush = (r: number, c: number, fill: string, line = fill) => {
+          for (let y = 0; y < rows; y++) for (let x = 0; x < cols; x++) {
+            const i = y * cols + x;
+            if (mask[i]) put(r + y, c + x, QUAD[mask[i]], kind[i] === 2 ? line : fill);
+          }
+        };
+        return { w, h, set, flush };
+      }
+
+      // The big temperature is drawn from a real font and cut to pixels, so its strokes are finer than a cell.
+      const rasters = new Map<string, boolean[][]>();
+      function raster(s: string, h: number): boolean[][] {
+        const key = `${s}/${h}`;
+        const hit = rasters.get(key);
+        if (hit) return hit;
+        const em = Math.round(h * 1.4);
+        const cv = document.createElement("canvas");
+        cv.width = Math.ceil(em * 0.65 * s.length) + 4;
+        cv.height = h + 8;
+        const ctx = cv.getContext("2d", { willReadFrequently: true })!;
+        ctx.font = `700 ${em}px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace`;
+        ctx.textBaseline = "alphabetic";
+        ctx.fillText(s, 1, h + 3);
+        const data = ctx.getImageData(0, 0, cv.width, cv.height).data;
+        const on = (x: number, y: number) => data[(y * cv.width + x) * 4 + 3] > 110;
+        let x0 = cv.width, x1 = -1, y0 = cv.height, y1 = -1;
+        for (let y = 0; y < cv.height; y++) for (let x = 0; x < cv.width; x++) if (on(x, y)) (x0 = Math.min(x0, x), x1 = Math.max(x1, x), y0 = Math.min(y0, y), y1 = Math.max(y1, y));
+        const grid: boolean[][] = [];
+        for (let y = y0; y <= y1; y++) grid.push(Array.from({ length: x1 - x0 + 1 }, (_, i) => on(x0 + i, y)));
+        rasters.set(key, grid);
+        return grid;
+      }
+
+
+      // --- state --------------------------------------------------------------
+      let weather: Weather | null = null;
+      let status: { kind: "load" | "ok" | "err"; text: string } = { kind: "load", text: DEFAULT_ZIP };
+      let request = 0;
+      const frames = new Map<SceneName, Frame>();
+      let sceneName: SceneName = "wind";
+      let sceneStart = performance.now();
+      let hoverGo = false;
+
+      const heroBox = document.querySelector<HTMLDivElement>("#hero")!;
+      let stopScene: (() => void) | null = null;
+      let heroRect = { r: 0, c: 0, w: 1, h: 1 };
+      let heroAspect = 2;
+      let heroKey = "";
+      let heroToken = 0;
+
+      // Lay the canvas over the hero panel's cells, scaled to cover them.
+      function placeHero() {
+        const box = screen.getBoundingClientRect();
+        const cw = box.width / W, ch = box.height / H;
+        const { r, c, w, h } = heroRect;
+        const bw = w * cw, bh = h * ch;
+        Object.assign(heroBox.style, { left: `${c * cw}px`, top: `${r * ch}px`, width: `${bw}px`, height: `${bh}px` });
+        const canvas = heroBox.firstElementChild as HTMLCanvasElement | null;
+        if (!canvas) return;
+        const width = Math.max(bw, bh * heroAspect);
+        Object.assign(canvas.style, { position: "absolute", width: `${width}px`, left: `${(bw - width) / 2}px`, top: `${(bh - width / heroAspect) / 2}px` });
+      }
+
+      async function showScene(name: SceneName) {
+        const token = ++heroToken;
+        const piece = await load[name]();
+        if (token !== heroToken) return;
+        stopScene?.();
+        stopScene = null;
+        heroBox.replaceChildren();
+        if (CANVAS.has(name)) {
+          const canvas = document.createElement("canvas");
+          canvas.setAttribute("aria-hidden", "true");
+          heroBox.append(canvas);
+          heroBox.style.display = "block";
+          heroAspect = piece.meta.cols / (piece.meta.rows * (piece.meta.cell ?? 2));
+          placeHero();
+          stopScene = mount(canvas, piece);
+        } else {
+          heroBox.style.display = "none";
+          frames.set(name, piece.default({ ...piece.meta.options }) as Frame);
+        }
+        if (sceneName !== name) {
+          sceneName = name;
+          sceneStart = performance.now();
+        }
+        heroKey = "";
+        redraw();
+      }
+
+      // --- the character grid -------------------------------------------------
+      let W = 120, H = 41;
+      let chars: string[] = [];
+      let kinds: string[] = [];
+      let go = { r: -1, c0: 0, c1: -1 };
+
+      const put = (r: number, c: number, ch: string, k = "") => {
+        if (r < 0 || r >= H || c < 0 || c >= W) return;
+        chars[r * W + c] = ch;
+        kinds[r * W + c] = k;
+      };
+      const text = (r: number, c: number, s: string, k = "") => {
+        for (const ch of s) put(r, c++, ch, k);
+        return c;
+      };
+      const hline = (r: number, c0: number, c1: number) => {
+        for (let c = c0; c <= c1; c++) put(r, c, "─", "d");
+      };
+      const vline = (c: number, r0: number, r1: number) => {
+        for (let r = r0; r <= r1; r++) put(r, c, "│", "d");
+      };
+      const frame = () => {
+        hline(0, 1, W - 2);
+        hline(H - 1, 1, W - 2);
+        vline(0, 1, H - 2);
+        vline(W - 1, 1, H - 2);
+        put(0, 0, "╭", "d"); put(0, W - 1, "╮", "d"); put(H - 1, 0, "╰", "d"); put(H - 1, W - 1, "╯", "d");
+      };
+      // A divider across the frame, with tees where it meets the frame and any column lines.
+      const divider = (r: number, up: number[] = [], down: number[] = []) => {
+        hline(r, 1, W - 2);
+        put(r, 0, "├", "d");
+        put(r, W - 1, "┤", "d");
+        for (const c of up) put(r, c, down.includes(c) ? "┼" : "┴", "d");
+        for (const c of down) if (!up.includes(c)) put(r, c, "┬", "d");
+      };
+      const fit = (s: string, n: number) => (s.length > n ? s.slice(0, Math.max(0, n - 1)) + "·" : s);
+      const bar = (value: number, max: number, n: number) => {
+        const k = Math.round((Math.max(0, Math.min(value, max)) / max) * n);
+        return "█".repeat(k) + "░".repeat(n - k);
+      };
+      const deg = (v: number | undefined) => (v === undefined ? "--" : String(Math.round(v)));
+
+      // --- components ---------------------------------------------------------
+      function field(r: number, c: number, now: number) {
+        const focus = document.activeElement === input;
+        const caret = focus && (still || Math.floor(now / 500) % 2 === 0) ? "▌" : " ";
+        c = text(r, c, "zip ", "m");
+        c = text(r, c, "[", focus ? "a" : "d");
+        c = text(r, c, ` ${(input.value + caret).padEnd(6)} `, focus ? "a" : "");
+        c = text(r, c, "]", focus ? "a" : "d");
+        go = { r, c0: c + 1, c1: c + 6 };
+        text(r, c + 1, "[ go ]", hoverGo ? "b" : "m");
+        return c + 7;
+      }
+
+      function location(r: number, c: number, end: number) {
+        const s = weather ? `${weather.place}, ${weather.state} · ${weather.date}` : "locating…";
+        const shown = fit(s, end - c + 1);
+        text(r, end - shown.length + 1, shown, weather ? "" : "m");
+      }
+
+      function statusLine(r: number, c: number, width: number, now: number) {
+        if (status.kind === "load") {
+          const spin = still ? "·" : SPIN[Math.floor(now / 120) % SPIN.length];
+          text(r, text(r, c, `${spin} `, "a"), fit(`loading forecast for ${status.text}`, width - 2), "m");
+        } else if (status.kind === "err") {
+          text(r, text(r, c, "x ", "e"), fit(status.text, width - 2), "e");
+        } else {
+          text(r, text(r, c, "● ", "a"), fit(status.text, width - 2), "m");
+        }
+      }
+
+      // Big temperature at pixel resolution: tall as the room allows, narrower when there are three characters.
+      // Block characters leave a thin gap between text rows, so the digits are painted on a canvas over their cells instead.
+      const bigCanvas = document.querySelector<HTMLCanvasElement>("#big")!;
+      let bigKey = "";
+      function bigTemp(r: number, c: number, maxW: number) {
+        const s = weather ? String(Math.round(weather.temp)) : "--";
+        let grid = raster(s, 14);
+        if (grid[0]?.length > maxW * 2 - 8) grid = raster(s, 10);
+        const cols = Math.ceil((grid[0]?.length ?? 0) / 2), rows = Math.ceil(grid.length / 2);
+        const box = screen.getBoundingClientRect();
+        const cw = box.width / W, ch = box.height / H;
+        const key = `${grid.map((row) => row.map((on) => (on ? 1 : 0)).join("")).join("/")}|${r},${c},${cw.toFixed(2)},${ch.toFixed(2)}`;
+        if (key !== bigKey) {
+          bigKey = key;
+          const dpr = devicePixelRatio || 1;
+          bigCanvas.width = Math.max(1, Math.round(cols * cw * dpr));
+          bigCanvas.height = Math.max(1, Math.round(rows * ch * dpr));
+          Object.assign(bigCanvas.style, { left: `${c * cw}px`, top: `${r * ch}px`, width: `${cols * cw}px`, height: `${rows * ch}px` });
+          const ctx = bigCanvas.getContext("2d")!;
+          ctx.fillStyle = "#d7f08f";
+          const pw = (cw * dpr) / 2, ph = (ch * dpr) / 2;
+          grid.forEach((row, y) => row.forEach((on, x) => on && ctx.fillRect(x * pw, y * ph, pw + 0.5, ph + 0.5)));
+        }
+        text(r, c + cols + 1, "°F", "a");
+        return rows;
+      }
+
+      function conditions(r: number, c: number) {
+        text(r, c, weather ? nameOf(weather.code) : "loading…", "h");
+        text(r + 1, c, `feels like ${deg(weather?.feels)}°`, "m");
+        let x = text(r + 3, c, "hi ", "m");
+        x = text(r + 3, x, `${deg(weather?.high)}°`);
+        x = text(r + 3, x + 3, "lo ", "m");
+        text(r + 3, x, `${deg(weather?.low)}°`);
+      }
+
+      const STATS = (w: Weather | null) => [
+        { label: "wind", value: w ? `${Math.round(w.wind)} mph` : "--", fill: w?.wind ?? 0, max: 40 },
+        { label: "humidity", value: w ? `${Math.round(w.humidity)}%` : "--", fill: w?.humidity ?? 0, max: 100 },
+        { label: "rain", value: w ? `${Math.round(w.rain)}%` : "--", fill: w?.rain ?? 0, max: 100 },
+      ];
+
+      // Stacked: a label and value row over a bar. Inline: label, value and bar on one row.
+      function stats(r: number, c: number, width: number, inline: boolean) {
+        STATS(weather).forEach((s, i) => {
+          if (inline) {
+            const y = r + i;
+            text(y, c, s.label, "m");
+            text(y, c + 9, s.value);
+            text(y, c + 18, bar(s.fill, s.max, width - 18), "a");
+          } else {
+            const y = r + i * 2;
+            text(y, c, s.label, "m");
+            text(y, c + width - s.value.length, s.value);
+            text(y + 1, c, bar(s.fill, s.max, width), "a");
+          }
+        });
+      }
+
+      function hero(r: number, c: number, w: number, h: number, now: number) {
+        heroRect = { r, c, w, h };
+        const key = `${r},${c},${w},${h},${W},${screen.style.fontSize}`;
+        if (key !== heroKey) ((heroKey = key), placeHero());
+        if (CANVAS.has(sceneName)) return; // the canvas sits over these cells
+        const make = frames.get(sceneName);
+        if (!make) {
+          text(r + Math.floor(h / 2), c + Math.floor((w - 15) / 2), "loading scene…", "m");
+          return;
+        }
+        const lines = make(still ? 0 : (now - sceneStart) / 1000, { paper: false }).split("\n");
+        const top = Math.max(0, Math.floor((lines.length - h) / 2));
+        const dy = Math.max(0, Math.floor((h - lines.length) / 2));
+        for (let i = 0; i < Math.min(h, lines.length - top); i++) {
+          const line = [...lines[top + i]];
+          const left = Math.max(0, Math.floor((line.length - w) / 2));
+          const dx = Math.max(0, Math.floor((w - line.length) / 2));
+          for (let j = 0; j < Math.min(w, line.length - left); j++) {
+            const ch = line[left + j];
+            if (ch !== " ") put(r + dy + i, c + dx + j, ch, "h");
+          }
+        }
+      }
+
+      // --- the hourly graphics: small halftone scenes, drawn with the same recipe as the big ones ---------
+      // Each dot's size comes from the brightness of its spot in the picture, through an ordered dither, and
+      // keeps the colour of that spot. A scene is a function from a place (u across 0..1.2, v down 0..1) to a colour.
+      type RGB = [number, number, number];
+      const BAYER_DOT = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5];
+      const mixc = (a: RGB, b: RGB, k: number): RGB => [a[0] + (b[0] - a[0]) * k, a[1] + (b[1] - a[1]) * k, a[2] + (b[2] - a[2]) * k];
+      const clamp01 = (x: number) => Math.max(0, Math.min(1, x));
+      const smoothstep = (a: number, b: number, x: number) => {
+        const k = clamp01((x - a) / (b - a));
+        return k * k * (3 - 2 * k);
+      };
+      const hash2 = (x: number, y: number) => {
+        let h = Math.imul(x | 0, 0x27d4eb2d) ^ Math.imul(y | 0, 0x165667b1);
+        h = Math.imul(h ^ (h >>> 15), 0x85ebca6b);
+        h ^= h >>> 13;
+        return (h >>> 0) / 4294967296;
+      };
+      const vnoise = (x: number, y: number) => {
+        const i = Math.floor(x), j = Math.floor(y), fx = x - i, fy = y - j;
+        const u = fx * fx * (3 - 2 * fx), v = fy * fy * (3 - 2 * fy);
+        const a = hash2(i, j), b = hash2(i + 1, j), c = hash2(i, j + 1), d = hash2(i + 1, j + 1);
+        return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+      };
+      const fbm = (x: number, y: number) => 0.55 * vnoise(x, y) + 0.3 * vnoise(x * 2.1 + 5, y * 2.1) + 0.15 * vnoise(x * 4.3 + 9, y * 4.3);
+      const distSeg = (px: number, py: number, ax: number, ay: number, bx: number, by: number) => {
+        const dx = bx - ax, dy = by - ay, k = clamp01(((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy));
+        return Math.hypot(px - ax - dx * k, py - ay - dy * k);
+      };
+      const add = (c: RGB, d: RGB, k: number): RGB => [c[0] + d[0] * k, c[1] + d[1] * k, c[2] + d[2] * k];
+
+      // A drifting bank of cloud centred on height yc: its alpha, and a light-to-shade colour.
+      function cloudAt(u: number, v: number, t: number, yc: number, size: number, speed: number, day: boolean, dark = 0): { a: number; c: RGB } {
+        const body = fbm(u * size - t * speed, v * size * 1.9) - Math.abs(v - yc) * 1.5;
+        const a = smoothstep(0.2, 0.34, body);
+        const light: RGB = day ? [244, 246, 250] : [128, 138, 170], shade: RGB = day ? [138, 150, 176] : [38, 46, 74];
+        const c = mixc(mixc(light, shade, clamp01((v - yc + 0.2) * 2.4)), [30, 26, 44], dark);
+        return { a, c };
+      }
+
+      function rainAt(u: number, v: number, t: number, density: number): number {
+        const col = Math.floor((u + v * 0.18) * 18), ph = hash2(col, 3);
+        if (hash2(col, 9) > density) return 0;
+        const y = (v - t * (1.1 + ph * 0.7) + ph * 9) % 1;
+        return smoothstep(0.68, 0.95, (y + 1) % 1);
+      }
+
+      function snowAt(u: number, v: number, t: number): number {
+        let best = 0;
+        for (let L = 0; L < 2; L++) {
+          const g = 12 + L * 9, gx = u * g, gy = v * g - t * (0.9 + L * 0.8), ix = Math.floor(gx), iy = Math.floor(gy), h = hash2(ix + L * 31, iy);
+          if (h < 0.78) continue;
+          const cx = ix + 0.5 + 0.28 * Math.sin(t * 1.3 + h * 40), cy = iy + 0.5;
+          best = Math.max(best, smoothstep(0.42 - L * 0.1, 0.1, Math.hypot(gx - cx, gy - cy)));
+        }
+        return best;
+      }
+
+      function sceneColor(kind: Kind, day: boolean, u: number, v: number, t: number): RGB {
+        const clearSky = (k: number): RGB => (day ? mixc([58, 118, 196], [250, 200, 142], k ** 1.6) : mixc([6, 10, 28], [40, 52, 98], k));
+        const greySky = (k: number): RGB => (day ? mixc([108, 118, 132], [182, 186, 192], k) : mixc([18, 22, 36], [48, 54, 74], k));
+        let c: RGB;
+        if (kind === "clear" || kind === "partly") {
+          c = clearSky(v);
+          const sx = kind === "partly" ? 0.42 : 0.62, sy = kind === "partly" ? 0.4 : 0.42;
+          const d = Math.hypot(u - sx, v - sy);
+          if (day) {
+            const ray = 0.78 + 0.22 * Math.sin(Math.atan2(v - sy, u - sx) * 8 + t * 0.8);
+            c = add(c, [255, 210, 120], Math.exp(-((d / 0.2) ** 2)) * 0.8 * ray);
+            if (d < 0.1) c = mixc(c, [255, 246, 214], smoothstep(0.1, 0.085, d));
+          } else {
+            const mx = 0.85, my = 0.34, md = Math.hypot(u - mx, v - my);
+            c = add(c, [120, 140, 200], Math.exp(-((md / 0.17) ** 2)) * 0.5);
+            if (md < 0.12) c = mixc(c, mixc([238, 238, 222], [170, 176, 176], clamp01(fbm(u * 18, v * 18) * 1.6 - 0.2)), smoothstep(0.12, 0.105, md));
+            const h = hash2(Math.floor(u * 24), Math.floor(v * 20));
+            if (h > 0.93 && v < 0.7) c = add(c, [255, 255, 235], (0.5 + 0.5 * Math.sin(t * 2 + h * 60)) * 0.9);
+          }
+          if (v > 0.8) {
+            const wave = fbm(u * 14 + t * 0.5, v * 40);
+            c = mixc(day ? [24, 62, 104] : [8, 16, 40], day ? [255, 214, 140] : [150, 164, 214], clamp01(Math.exp(-(((u - sx) / 0.14) ** 2)) * smoothstep(0.55, 0.8, wave)));
+          }
+          if (kind === "partly") {
+            const cl = cloudAt(u, v, t, 0.55, 3.2, 0.25, day);
+            c = mixc(c, cl.c, cl.a);
+          }
+        } else if (kind === "cloudy") {
+          c = greySky(v);
+          for (const [yc, size, sp] of [[0.3, 3, 0.2], [0.62, 4, 0.32]] as const) {
+            const cl = cloudAt(u, v, t, yc, size, sp, day);
+            c = mixc(c, cl.c, cl.a * 0.9);
+          }
+        } else if (kind === "fog") {
+          c = day ? mixc([160, 176, 170], [206, 214, 208], v) : mixc([24, 32, 40], [64, 76, 84], v);
+          const ridge = 0.5 + 0.1 * Math.sin(u * 7 + 1) + 0.07 * vnoise(u * 9, 2);
+          if (v > ridge) {
+            const trees = hash2(Math.floor(u * 30), 4) * 0.08;
+            c = mixc(c, day ? [34, 64, 54] : [8, 20, 22], smoothstep(ridge + trees * 0.4, ridge + 0.03, v) * 0.9);
+          }
+          for (const y0 of [0.42, 0.62, 0.82]) c = mixc(c, day ? [232, 238, 232] : [96, 108, 116], smoothstep(0.55, 0.8, fbm(u * 3 + t * 0.25 + y0 * 9, (v - y0) * 9)) * smoothstep(0.17, 0, Math.abs(v - y0)) * 0.85);
+        } else if (kind === "snow") {
+          c = greySky(v);
+          const cl = cloudAt(u, v, t, 0.2, 3, 0.15, day);
+          c = mixc(c, cl.c, cl.a);
+          if (v > 0.86) c = mixc(c, day ? [240, 246, 252] : [150, 160, 190], smoothstep(0.86, 0.9, v + (fbm(u * 8, 1) - 0.5) * 0.06));
+          c = mixc(c, [255, 255, 255], snowAt(u, v, t) * 0.95);
+        } else {
+          // rain and storm: a dark ceiling of cloud and falling streaks
+          c = kind === "storm" ? (day ? mixc([74, 64, 110], [132, 116, 152], v) : mixc([24, 24, 52], [60, 54, 90], v)) : day ? mixc([84, 96, 114], [150, 160, 174], v) : mixc([24, 30, 50], [62, 72, 96], v);
+          const cl = cloudAt(u, v, t, 0.2, 3, 0.3, day, kind === "storm" ? 0.4 : 0.15);
+          c = mixc(c, cl.c, cl.a);
+          c = mixc(c, [196, 224, 252], rainAt(u, v, t, kind === "storm" ? 0.6 : 0.85) * smoothstep(0.2, 0.36, v));
+          if (kind === "storm") {
+            const phase = (t * 0.45) % 1, flash = phase < 0.22 ? 1 - phase / 0.22 : 0;
+            c = add(c, [150, 140, 200], flash * 0.5);
+            if (flash > 0.1) {
+              const pts: [number, number][] = [[0.66, 0.24], [0.58, 0.46], [0.68, 0.5], [0.54, 0.76], [0.6, 0.9]];
+              let d = 9;
+              for (let i = 0; i < pts.length - 1; i++) d = Math.min(d, distSeg(u, v, pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1]));
+              c = mixc(c, [255, 250, 205], smoothstep(0.03, 0.01, d));
+              c = add(c, [255, 230, 120], Math.exp(-((d / 0.05) ** 2)) * 0.45);
+            }
+          }
+        }
+        return c;
+      }
+
+      const DOT_COLS = 36, DOT_ROWS = 30;
+      const DOT_LEVELS = [0, 0.34, 0.6, 0.82, 1];
+      let thumbSpecs: { x: number; y: number; w: number; h: number; kind: Kind; day: boolean; seed: number }[] = [];
+      let thumbKey = "";
+      const thumbsBox = document.querySelector<HTMLDivElement>("#thumbs")!;
+
+      function drawThumbs(now: number) {
+        const t = still ? 0 : now / 1000;
+        thumbsBox.childNodes.forEach((node, i) => {
+          const cv = node as HTMLCanvasElement, s = thumbSpecs[i];
+          if (!s) return;
+          const ctx = cv.getContext("2d")!;
+          ctx.fillStyle = "#05070a";
+          ctx.fillRect(0, 0, cv.width, cv.height);
+          const cx = cv.width / DOT_COLS, cy = cv.height / DOT_ROWS, aspect = s.w / s.h;
+          for (let y = 0; y < DOT_ROWS; y++) for (let x = 0; x < DOT_COLS; x++) {
+            const [r, g, b] = sceneColor(s.kind, s.day, ((x + 0.5) / DOT_COLS) * aspect, (y + 0.5) / DOT_ROWS, t + s.seed);
+            const lum = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
+            const level = DOT_LEVELS[Math.max(0, Math.min(4, Math.floor(lum ** 0.7 * 4.6 + (BAYER_DOT[(y & 3) * 4 + (x & 3)] / 16 - 0.47))))];
+            if (!level) continue;
+            ctx.fillStyle = `rgb(${r | 0},${g | 0},${b | 0})`;
+            ctx.beginPath();
+            ctx.arc((x + 0.5) * cx, (y + 0.5) * cy, Math.min(cx, cy) * 0.52 * level, 0, 6.2832);
+            ctx.fill();
+          }
+        });
+      }
+
+      function placeThumbs(r: number, c: number, colW: number, hours: Hour[]) {
+        const box = screen.getBoundingClientRect();
+        const cw = box.width / W, ch = box.height / H;
+        const specs = hours.map((h, i) => ({ x: (c + i * colW + 1) * cw, y: (r + 1) * ch, w: (colW - 2) * cw, h: 5 * ch, kind: kindOf(h.code), day: h.day, seed: i * 1.7 }));
+        const key = `${specs.map((s) => s.kind + +s.day).join()}|${cw.toFixed(2)},${ch.toFixed(2)},${r},${c},${colW}`;
+        if (key === thumbKey) return;
+        thumbKey = key;
+        thumbSpecs = specs;
+        const dpr = devicePixelRatio || 1;
+        thumbsBox.replaceChildren(
+          ...specs.map((s) => {
+            const cv = document.createElement("canvas");
+            cv.width = Math.round(s.w * dpr);
+            cv.height = Math.round(s.h * dpr);
+            Object.assign(cv.style, { left: `${s.x}px`, top: `${s.y}px`, width: `${s.w}px`, height: `${s.h}px` });
+            return cv;
+          }),
+        );
+        drawThumbs(performance.now());
+      }
+
+
+      const mid = (r: number, x: number, w: number, s: string, k = "") => text(r, x + Math.max(0, Math.floor((w - s.length) / 2)), s, k);
+
+      // Each hour is a centred column; one smooth temperature curve runs under all of them at 2x2 pixels a cell.
+      function hourly(r: number, c: number, n: number, colW: number, now: number) {
+        const hours = weather?.hours.slice(0, n) ?? [];
+        placeThumbs(r, c, colW, hours);
+        for (let i = 0; i < n; i++) {
+          const x = c + i * colW;
+          const h = hours[i];
+          if (!h) {
+            mid(r, x, colW, "--", "m");
+            continue;
+          }
+          mid(r, x, colW, h.label, i === 0 ? "a" : "m");
+          mid(r + 6, x, colW, `${Math.round(h.temp)}°`, i === 0 ? "a" : "");
+          mid(r + 7, x, colW, fit(nameOf(h.code).toLowerCase(), colW - 1), "m");
+          const pct = `${Math.round(h.rain)}%`;
+          const start = x + Math.floor((colW - (5 + 1 + pct.length)) / 2);
+          text(r + 8, text(r + 8, start, bar(h.rain, 100, 5), "c") + 1, pct, "m");
+        }
+        if (hours.length < 2) return;
+        const temps = hours.map((h) => h.temp);
+        const lo = Math.min(...temps), hi = Math.max(...temps), mean = (lo + hi) / 2, span = Math.max(hi - lo, 8);
+        const rows = 4, canvas = pixels(n * colW, rows);
+        const px = (i: number) => Math.round((i * colW + colW / 2) * 2);
+        const py = (v: number) => 3.5 - ((v - mean) / span) * 5; // 1..6 of 8 pixel rows
+        let prev = -1;
+        for (let x = px(0); x <= px(hours.length - 1); x++) {
+          let i = 0;
+          while (i < hours.length - 2 && x > px(i + 1)) i++;
+          const u = (x - px(i)) / (px(i + 1) - px(i));
+          const y = Math.round(py(hours[i].temp) + (py(hours[i + 1].temp) - py(hours[i].temp)) * ((1 - Math.cos(Math.PI * u)) / 2));
+          for (let yy = Math.min(y, prev < 0 ? y : prev); yy <= Math.max(y, prev < 0 ? y : prev); yy++) canvas.set(x, yy, true);
+          prev = y;
+        }
+        hours.forEach((h, i) => {
+          const x = px(i), y = Math.round(py(h.temp));
+          for (const [dx, dy] of [[0, -1], [-1, 0], [1, 0], [0, 1], [0, 0]]) canvas.set(x + dx, y + dy, true);
+        });
+        canvas.flush(r + 9, c, "d", "a");
+        // Say what the line is: the temperature through these hours, with its top and bottom marked.
+        text(r + 9, c, `${Math.round(hi)}°`, "m");
+        text(r + 10, c, "temp", "m");
+        text(r + 12, c, `${Math.round(lo)}°`, "m");
+      }
+
+      // --- layouts ------------------------------------------------------------
+      const LC = 38; // the wide layout's left column rule
+      function wide(now: number) {
+        frame();
+        text(0, 2, " weather ", "a");
+        text(0, W - 14, " ascii.rest ", "m");
+        const after = field(1, 2, now);
+        location(1, after + 2, W - 3);
+        statusLine(2, 2, W - 4, now);
+        divider(3, [], [LC]);
+        vline(LC, 4, 25);
+        bigTemp(5, 3, LC - 6);
+        conditions(14, 3);
+        stats(19, 3, LC - 6, false);
+        hero(4, LC + 1, W - LC - 2, 22, now);
+        divider(26, [LC]);
+        text(26, 2, " next hours ", "m");
+        hourly(27, 2, 8, 14, now);
+        text(H - 1, 2, " data: open-meteo · zippopotam.us ", "m");
+      }
+
+      function narrow(now: number) {
+        frame();
+        text(0, 2, " weather ", "a");
+        text(0, W - 14, " ascii.rest ", "m");
+        field(1, 2, now);
+        location(2, 2, W - 3);
+        statusLine(3, 2, W - 4, now);
+        divider(4);
+        hero(5, 1, 66, 20, now);
+        divider(25);
+        bigTemp(26, 3, 25);
+        conditions(27, 30);
+        stats(34, 3, 62, true);
+        divider(37);
+        text(37, 2, " next hours ", "m");
+        hourly(38, 2, 5, 13, now);
+        text(H - 1, 2, " data: open-meteo · zippopotam.us ", "m");
+      }
+
+      let layout = wide;
+      function compose(now: number) {
+        chars = new Array(W * H).fill(" ");
+        kinds = new Array(W * H).fill("");
+        layout(now);
+      }
+
+      const escape = (ch: string) => (ch === "&" ? "&amp;" : ch === "<" ? "&lt;" : ch === ">" ? "&gt;" : ch);
+      function render() {
+        let html = "";
+        for (let r = 0; r < H; r++) {
+          let k = kinds[r * W], run = "";
+          const flush = () => {
+            if (run) html += k ? `<span class="${k}">${run}</span>` : run;
+            run = "";
+          };
+          for (let c = 0; c < W; c++) {
+            const i = r * W + c;
+            if (kinds[i] !== k) (flush(), (k = kinds[i]));
+            run += escape(chars[i]);
+          }
+          flush();
+          if (r < H - 1) html += "\n";
+        }
+        screen.innerHTML = html;
+      }
+
+      function redraw() {
+        compose(performance.now());
+        render();
+        drawThumbs(performance.now());
+      }
+
+      // --- sizing: wide layout when its text can stay legible -----------------
+      let ratio = 0.6;
+      function measure() {
+        const probe = document.createElement("span");
+        probe.textContent = "0".repeat(100);
+        probe.style.cssText = "position:absolute;visibility:hidden;white-space:pre;font-size:100px;font-family:inherit";
+        screen.append(probe);
+        ratio = probe.getBoundingClientRect().width / 100 / 100 || 0.6;
+        probe.remove();
+      }
+      function size() {
+        const avail = Math.min(innerWidth, 1400) - 24;
+        const isWide = avail / (120 * ratio) >= 9;
+        [W, H, layout] = isWide ? [120, 41, wide] : [68, 52, narrow];
+        screen.style.fontSize = `${Math.min(15, Math.floor((avail / (W * ratio)) * 10) / 10)}px`;
+        redraw();
+      }
+
+      // --- data ---------------------------------------------------------------
+      const hourLabel = (stamp: string) => {
+        const hour = Number(stamp.slice(11, 13));
+        return `${hour % 12 || 12} ${hour < 12 ? "am" : "pm"}`;
+      };
+      const dayLabel = (stamp: string) => {
+        const [y, m, d] = stamp.slice(0, 10).split("-").map(Number);
+        return new Intl.DateTimeFormat("en-US", { weekday: "long", month: "long", day: "numeric", timeZone: "UTC" }).format(new Date(Date.UTC(y, m - 1, d, 12)));
+      };
+
+      function setStatus(kind: "load" | "ok" | "err", value: string) {
+        status = { kind, text: value };
+        if (kind !== "ok") announce.textContent = kind === "load" ? `Loading forecast for ${value}` : value;
+        redraw();
+      }
+
+      async function loadWeather(zip: string) {
+        const run = ++request;
+        setStatus("load", zip);
+        try {
+          const placeResponse = await fetch(`https://api.zippopotam.us/us/${zip}`);
+          if (!placeResponse.ok) throw new Error(`no US location found for ZIP ${zip}`);
+          const town = (await placeResponse.json()).places?.[0];
+          if (!town) throw new Error(`no US location found for ZIP ${zip}`);
+          const url = new URL("https://api.open-meteo.com/v1/forecast");
+          url.search = new URLSearchParams({
+            latitude: town.latitude,
+            longitude: town.longitude,
+            current: "temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m,is_day",
+            hourly: "temperature_2m,precipitation_probability,weather_code,is_day",
+            daily: "temperature_2m_max,temperature_2m_min",
+            temperature_unit: "fahrenheit",
+            wind_speed_unit: "mph",
+            timezone: "auto",
+            forecast_days: "2",
+          }).toString();
+          const response = await fetch(url);
+          if (!response.ok) throw new Error("weather data is unavailable, try again");
+          const data = await response.json();
+          if (run !== request) return;
+          const { current, hourly: h, daily } = data;
+          let start = h.time.findIndex((stamp: string) => stamp >= current.time.slice(0, 13));
+          if (start < 0) start = 0;
+          const hours: Hour[] = [];
+          for (let i = start; i < Math.min(start + 8, h.time.length); i++) {
+            hours.push({
+              label: i === start ? "now" : hourLabel(h.time[i]),
+              temp: h.temperature_2m[i],
+              code: h.weather_code[i],
+              rain: h.precipitation_probability[i] ?? 0,
+              day: h.is_day[i] === 1,
+            });
+          }
+          const updated = new Intl.DateTimeFormat("en-US", { hour: "numeric", minute: "2-digit", timeZone: data.timezone }).format(new Date());
+          weather = {
+            zip,
+            place: town["place name"],
+            state: town["state abbreviation"] ?? town.state,
+            date: dayLabel(current.time),
+            zone: data.timezone,
+            updated,
+            temp: current.temperature_2m,
+            feels: current.apparent_temperature,
+            code: current.weather_code,
+            day: current.is_day === 1,
+            high: daily.temperature_2m_max[0],
+            low: daily.temperature_2m_min[0],
+            wind: current.wind_speed_10m,
+            humidity: current.relative_humidity_2m,
+            rain: hours[0]?.rain ?? 0,
+            hours,
+          };
+          try {
+            localStorage.setItem("weather-zip", zip);
+          } catch {}
+          summary.textContent =
+            `${town["place name"]}, ${town.state}. ${Math.round(weather.temp)}°F, ${nameOf(weather.code).toLowerCase()}. ` +
+            `Feels like ${Math.round(weather.feels)}°. High ${Math.round(weather.high)}°, low ${Math.round(weather.low)}°. ` +
+            `Wind ${Math.round(weather.wind)} mph, humidity ${Math.round(weather.humidity)}%, rain chance ${Math.round(weather.rain)}%.`;
+          setStatus("ok", `zip ${zip} · ${data.timezone} · updated ${updated}`);
+          showScene(scene(weather.code, weather.day));
+        } catch (error) {
+          if (run !== request) return;
+          setStatus("err", error instanceof Error ? error.message : "could not load weather, try again");
+        }
+      }
+
+      // --- input --------------------------------------------------------------
+      form.addEventListener("submit", (event) => {
+        event.preventDefault();
+        const zip = input.value.trim();
+        if (!/^\d{5}$/.test(zip)) return setStatus("err", "enter a 5-digit US ZIP code");
+        loadWeather(zip);
+      });
+      input.addEventListener("input", () => {
+        input.value = input.value.replace(/\D/g, "").slice(0, 5);
+        redraw();
+      });
+      input.addEventListener("focus", redraw);
+      input.addEventListener("blur", redraw);
+
+      // The screen is one picture: map a pointer to its cell to press [ go ] or focus the field.
+      const cellAt = (e: PointerEvent) => {
+        const rect = screen.getBoundingClientRect();
+        return { r: Math.floor(((e.clientY - rect.top) / rect.height) * H), c: Math.floor(((e.clientX - rect.left) / rect.width) * W) };
+      };
+      const onGo = (e: PointerEvent) => {
+        const { r, c } = cellAt(e);
+        return r === go.r && c >= go.c0 && c <= go.c1;
+      };
+      screen.addEventListener("pointerdown", (e) => {
+        e.preventDefault();
+        if (onGo(e)) form.requestSubmit();
+        else input.focus();
+      });
+      screen.addEventListener("pointermove", (e) => {
+        const over = onGo(e);
+        screen.style.cursor = over ? "pointer" : "text";
+        if (over !== hoverGo) ((hoverGo = over), redraw());
+      });
+      screen.addEventListener("pointerleave", () => {
+        if (hoverGo) ((hoverGo = false), redraw());
+      });
+
+      // --- start --------------------------------------------------------------
+      try {
+        const saved = localStorage.getItem("weather-zip");
+        if (saved && /^\d{5}$/.test(saved)) input.value = saved;
+      } catch {}
+      measure();
+      size();
+      addEventListener("resize", size);
+      document.fonts?.ready.then(() => (measure(), size()));
+      showScene("wind");
+      loadWeather(input.value);
+      if (!still) {
+        let last = 0;
+        const loop = (now: number) => {
+          if (now - last >= 80) ((last = now), compose(now), render(), drawThumbs(now));
+          requestAnimationFrame(loop);
+        };
+        requestAnimationFrame(loop);
+      }
+    </script>
+  </body>
+</html>

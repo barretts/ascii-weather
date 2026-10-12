@@ -1,0 +1,15 @@
+{
+  "name": "ascii-weather",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "astro dev",
+    "build": "astro build",
+    "preview": "astro preview"
+  },
+  "dependencies": {
+    "ascii.rest": "github:bas3line/ascii#1848fa567573e922caa76f95a158b3b7a19043dc",
+    "astro": "^5.16.5"
+  }
+}
